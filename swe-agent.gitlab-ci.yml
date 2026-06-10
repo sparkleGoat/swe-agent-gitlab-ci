@@ -1,0 +1,1264 @@
+stages: [swe]
+
+variables:
+SWE_MODEL: "gpt-5"
+SWE_BRANCH_PREFIX: "swe-agent/"
+SWE_TASK: "Lint small issues, ensure unit testing coverage (add tests with mocks as needed), no API changes."
+SWE_TASK_SOURCE: "env,MR_TITLE,MR_DESC,MR_COMMENTS"
+SWE_REQUIRE_LABEL: "run:swe"
+SWE_AGENT_REPO: "https://github.com/SWE-agent/SWE-agent.git"
+SWE_AGENT_REF: "48bd0b8fcd523c857e2acf336e2768119584331a"
+SWE_DEPLOYMENT_TYPE: "local"
+SWE_MAX_INPUT_TOKENS: "128000"
+SWE_INSTANCE_COST_LIMIT: "0.00"
+SWE_TOTAL_COST_LIMIT: "0"
+SWE_PER_INSTANCE_CALL_LIMIT: "100"
+
+DOCKER_HOST: "tcp://docker:2375"
+DOCKER_TLS_CERTDIR: ""    # disable TLS in dind
+DOCKER_DRIVER: "overlay2"
+DOCKER_BUILDKIT: "1"
+
+swe-agent:
+# Used custom image internally
+image: sweagent/swe-agent:latest
+stage: swe
+services:
+- name: docker:dind
+alias: docker            # ensure hostname "docker"
+rules:
+# Run hourly watcher schedules
+- if: '$CI_PIPELINE_SOURCE == "schedule"'
+when: on_success
+# Everything else: never
+- when: never
+
+before_script:
+- set -eu
+# 1) Install CA bundle tools (you already have ca-certificates via apk add)
+- apk add --no-cache ca-certificates
+# 2) Write your CA to the system trust path
+- |
+cat > /usr/local/share/ca-certificates/gitlab-self.crt <<'CRT'
+-----BEGIN CERTIFICATE----
+<Insert Cert>
+-----END CERTIFICATE-----
+CRT
+update-ca-certificates
+# WORKING VERSIOn
+# - apk add --no-cache python3 py3-pip py3-virtualenv python3-dev bash git curl jq build-base musl-dev linux-headers rust cargo
+# - python3 -m venv /venv
+# - /venv/bin/python -m ensurepip --upgrade || true
+# - /venv/bin/pip install -U pip setuptools wheel
+# editable install from a clone OUTSIDE the repo (prevents submodule)
+# - SWE_SRC=/opt/swe-agent-src
+# - rm -rf "$SWE_SRC"
+# - git clone --depth 1 "${SWE_AGENT_REPO}" "$SWE_SRC"
+# - |
+#   if [ -n "${SWE_AGENT_REF:-}" ]; then
+#     cd "$SWE_SRC"
+#     git fetch --depth 1 origin "${SWE_AGENT_REF}" || true
+#     git checkout "${SWE_AGENT_REF}"
+#     cd - >/dev/null
+#   fi
+# - /venv/bin/pip install --no-cache-dir -e "$SWE_SRC"
+# TLS for curl/requests/git
+- export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+- export CURL_CA_BUNDLE=$SSL_CERT_FILE
+- export REQUESTS_CA_BUNDLE=$SSL_CERT_FILE
+- git config --global http."${CI_SERVER_URL}/".sslCAInfo "$SSL_CERT_FILE"
+# DinD wait (still non-TLS here; change if you use TLS)
+- |
+echo "Waiting for docker:dind at ${DOCKER_HOST:-tcp://docker:2375} ..."
+for i in $(seq 1 30); do
+  if wget -qO- "http://${DOCKER_HOST#tcp://}/_ping" 2>/dev/null | grep -q OK; then
+    echo "DinD ready"; break; fi; sleep 1; done
+docker version
+script:
+- |
+# ---- SWE-agent job script (drop-in) ------------------------------------------
+set -euo pipefail
+
+# Be strict about unset vars we removed earlier
+unset BUNDLE_PATH 2>/dev/null || true
+
+# 0) Optional label gate (skip if MR missing required label)
+if [ -n "${CI_MERGE_REQUEST_IID:-}" ] && [ -n "${SWE_REQUIRE_LABEL:-}" ]; then
+  HDR="JOB-TOKEN: ${CI_JOB_TOKEN:-}"; [ -n "${GITLAB_TOKEN:-}" ] && HDR="PRIVATE-TOKEN: ${GITLAB_TOKEN}"
+  HAS=$(curl -sS --header "$HDR" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID" \
+        | jq -e --arg L "$SWE_REQUIRE_LABEL" '.labels | index($L)') || true
+  if [ "$HAS" = "null" ]; then
+    echo "MR missing label '$SWE_REQUIRE_LABEL' → skip."
+    exit 0
+  fi
+fi
+
+
+if [ "${CI_PIPELINE_SOURCE:-}" = "schedule" ]; then
+  ISSUE_HEADER='JOB-TOKEN'
+  ISSUE_AUTH_TOKEN="${CI_JOB_TOKEN:-}"
+  if [ -n "${GITLAB_TOKEN:-}" ]; then
+    ISSUE_HEADER='PRIVATE-TOKEN'
+    ISSUE_AUTH_TOKEN="${GITLAB_TOKEN}"
+  fi
+  if [ -z "$ISSUE_AUTH_TOKEN" ]; then
+    echo "No API token available to query issues; skipping schedule run."
+    exit 0
+  fi
+  export ISSUE_HEADER ISSUE_AUTH_TOKEN
+  ISSUE_DATA=$(python3 <<'PYISSUE'
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+def log(message):
+    print(f"[ISSUEDATA] {message}", file=sys.stderr, flush=True)
+
+api = os.getenv('CI_API_V4_URL')
+project = os.getenv('CI_PROJECT_ID')
+project_path = os.getenv('CI_PROJECT_PATH')
+label = os.getenv('SWE_REQUIRE_LABEL', 'run:swe')
+header = os.getenv('ISSUE_HEADER')
+token = os.getenv('ISSUE_AUTH_TOKEN')
+if not api or (not project and not project_path) or not header or not token:
+    log("Missing GitLab API context; skipping issue lookup.")
+    sys.exit(0)
+project_candidates = []
+if project:
+    project_candidates.append(project)
+if project_path:
+    project_candidates.append(urllib.parse.quote(project_path, safe=''))
+param_candidates = []
+base_params = {
+    'state': 'opened',
+    'per_page': '20',
+    'order_by': 'updated_at',
+    'sort': 'asc',
+    'scope': 'all',
+}
+params_primary = base_params.copy()
+params_primary['labels'] = label
+param_candidates.append(params_primary)
+params_legacy = base_params.copy()
+params_legacy['labels[]'] = [label]
+param_candidates.append(params_legacy)
+issues = []
+for project_identifier in project_candidates:
+    log(f"Querying project '{project_identifier}' for issues with label '{label}'.")
+    for params in param_candidates:
+        query = urllib.parse.urlencode(params, doseq=True)
+        url = f"{api}/projects/{project_identifier}/issues?{query}"
+        req = urllib.request.Request(url, headers={header: token})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.load(resp)
+        except Exception as exc:
+            log(f"Issue lookup failed for {project_identifier}: {exc}")
+            continue
+        if isinstance(data, list):
+            log(f"Received {len(data)} candidate issues from {project_identifier}.")
+            if data:
+                issues = data
+                break
+    if issues:
+        break
+if not issues:
+    log("No open issues returned by GitLab API.")
+    sys.exit(0)
+selected = None
+for issue in issues:
+    labels = {str(label).lower() for label in issue.get('labels', [])}
+    if 'swe:in-progress' in labels:
+        log(f"Skipping issue #{issue.get('iid')} already labeled 'swe:in-progress'.")
+        continue
+    selected = issue
+    break
+if not selected:
+    log("All fetched issues are already in progress; nothing to schedule.")
+    sys.exit(0)
+log(f"Selected issue #{selected.get('iid')} - {selected.get('title')!r}.")
+print(json.dumps(selected))
+PYISSUE
+  )
+  if [ -z "$ISSUE_DATA" ]; then
+    echo "No open issues labeled '${SWE_REQUIRE_LABEL:-run:swe}' need attention right now."
+    exit 0
+  fi
+  ISSUE_IID=$(echo "$ISSUE_DATA" | jq -r '.iid')
+  ISSUE_TITLE=$(echo "$ISSUE_DATA" | jq -r '.title')
+  ISSUE_DESC=$(echo "$ISSUE_DATA" | jq -r '.description // ""')
+  ISSUE_WEB=$(echo "$ISSUE_DATA" | jq -r '.web_url // ""')
+  printf -v SWE_BRANCH 'swe-agent/issue-%s' "$ISSUE_IID"
+  printf -v SWE_TITLE 'chore(issue #%s): %s' "$ISSUE_IID" "$ISSUE_TITLE"
+  printf -v SWE_TASK '%s' "$ISSUE_DESC"
+  if [ -z "$SWE_TASK" ]; then
+    printf -v SWE_TASK 'Review issue #%s (%s) and implement the requested changes.' "$ISSUE_IID" "$ISSUE_WEB"
+  fi
+  printf -v MR_DESC "Automated follow-up for issue #%s (%s).\n\nIssue description:\n%s" "$ISSUE_IID" "$ISSUE_WEB" "$ISSUE_DESC"
+  if [ -z "${SWE_TARGET:-}" ]; then
+    SWE_TARGET="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-${CI_DEFAULT_BRANCH:-main}}"
+  fi
+  export SWE_BRANCH SWE_TITLE SWE_TASK MR_DESC SWE_TARGET
+  export SUBMIT_TARGET_BRANCH="$SWE_TARGET"
+  export MR_TITLE="$SWE_TITLE"
+  export SWE_DESCRIPTION="$MR_DESC"
+  ISSUE_MODEL=$(echo "$ISSUE_DATA" | jq -r '([.labels[]? | tostring | select(startswith("model:"))] | .[0]) // ""')
+  if [ -n "$ISSUE_MODEL" ]; then
+    OPENAI_MODEL="${ISSUE_MODEL#model:}"
+    SWE_MODEL="$OPENAI_MODEL"
+    export OPENAI_MODEL SWE_MODEL
+    echo "Using model from issue label: $OPENAI_MODEL"
+  fi
+  ISSUE_BASEURL=$(echo "$ISSUE_DATA" | jq -r '([.labels[]? | tostring | select(startswith("baseurl:"))] | .[0]) // ""')
+  if [ -n "$ISSUE_BASEURL" ]; then
+    OPENAI_API_BASE="${ISSUE_BASEURL#baseurl:}"
+    OPENAI_BASE_URL="$OPENAI_API_BASE"
+    SWE_HAS_LABEL_API_BASE=1
+    export OPENAI_API_BASE OPENAI_BASE_URL SWE_HAS_LABEL_API_BASE
+    echo "Using API base from issue label: $OPENAI_API_BASE"
+  fi
+  ISSUE_LABELS=$(echo "$ISSUE_DATA" | jq -r '.labels + ["swe:in-progress"] | unique | join(",")')
+  if [ -n "$ISSUE_LABELS" ]; then
+    export CI_MERGE_REQUEST_LABELS="$ISSUE_LABELS"
+    curl -sS -X PUT "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues/${ISSUE_IID}"             -H "$ISSUE_HEADER: $ISSUE_AUTH_TOKEN" --data-urlencode "labels=$ISSUE_LABELS" >/dev/null || true
+  fi
+  if [ -n "$ISSUE_WEB" ]; then
+    curl -sS -X POST "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues/${ISSUE_IID}/notes"             -H "$ISSUE_HEADER: $ISSUE_AUTH_TOKEN" --data-urlencode "body=Scheduled SWE-agent run started on branch \`$SWE_BRANCH\` (pipeline $CI_PIPELINE_ID)." >/dev/null || true
+  fi
+fi
+
+# 1) Stage repo at /$REPO_NAME (SWE-agent expects to run inside the repo root)
+REPO_NAME="$(basename "$CI_PROJECT_DIR")"
+TARGET="/${REPO_NAME}"
+export TARGET
+rm -rf "$TARGET" || true
+cp -a "$CI_PROJECT_DIR" "$TARGET"
+
+# 2) MR metadata seed (so finalize works even if model forgets flags/files)
+DEFAULT_TITLE="${SWE_TITLE:-chore(swe-agent): automated changes}"
+DEFAULT_DESC="${SWE_DESCRIPTION:-Lint small issues, ensure unit testing coverage (add tests with mocks as needed), no API changes.}"
+SUBMIT_TITLE="${MR_TITLE:-$DEFAULT_TITLE}"
+DEFAULT_TARGET="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-${CI_DEFAULT_BRANCH:-main}}"
+SUBMIT_DESCRIPTION="${MR_DESC:-$DEFAULT_DESC}"
+
+printf '%s\n' "$SUBMIT_TITLE"       > "${TARGET}/mrtitle.txt"
+printf '%s\n' "$SUBMIT_DESCRIPTION" > "${TARGET}/mrdesc.txt"
+
+cat > "${TARGET}/mrdesc.txt" <<EOF
+<TITLE>
+$SUBMIT_TITLE
+</TITLE>
+<PR_DESCRIPTION>
+$SUBMIT_DESCRIPTION
+</PR_DESCRIPTION>
+EOF
+
+mkdir -p "${TARGET}/.git/swe"
+rm -f "${TARGET}/.git/swe/finalized"
+jq -n --arg title "$SUBMIT_TITLE" --arg desc "$SUBMIT_DESCRIPTION" --arg dst "$DEFAULT_TARGET" \
+  '{title:$title, desc:$desc, target:$dst}' > "${TARGET}/.git/swe/meta.json"
+MR_BRANCH="${SWE_BRANCH:-${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME:-${CI_COMMIT_REF_NAME:-${CI_COMMIT_BRANCH:-}}}}"
+if [ "$MR_BRANCH" = "HEAD" ]; then
+  MR_BRANCH=""
+fi
+if [ -z "$MR_BRANCH" ]; then
+  MR_BRANCH="$(cd "$TARGET" && git symbolic-ref -q --short HEAD 2>/dev/null || echo '')"
+fi
+if [ "$MR_BRANCH" = "HEAD" ]; then
+  MR_BRANCH=""
+fi
+if [ -n "$MR_BRANCH" ]; then
+  printf '%s\n' "$MR_BRANCH" > "${TARGET}/.git/swe/branch"
+  (cd "$TARGET" && git fetch origin "$MR_BRANCH" 2>/dev/null || true)
+fi
+
+# 3) Safe edit helpers + snippet (no heredocs / interactive editors)
+mkdir -p "${TARGET}/scripts/swe/snippets"
+
+cat > "${TARGET}/scripts/swe/insert_after_regex" <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+[ $# -eq 3 ] || { echo "usage: insert_after_regex <file> <regex> <b64content>" >&2; exit 2; }
+f="$1"; rx="$2"; b64="$3"
+tmp="$(mktemp)"
+content="$(printf '%s' "$b64" | base64 -d)"
+awk -v rx="$rx" -v ins="$content" '
+  { print }
+  $0 ~ rx { print ins }
+' "$f" > "$tmp"
+mv "$tmp" "$f"
+BASH
+chmod +x "${TARGET}/scripts/swe/insert_after_regex"
+install -m 755 "${TARGET}/scripts/swe/insert_after_regex" /usr/local/bin/insert_after_regex
+
+cat > "${TARGET}/scripts/swe/write_file_b64" <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+  Usage: write_file_b64 PATH [B64|-] [--append] [--chmod MODE] [--parents] [--from-file FILE]
+  Write base64-encoded content to PATH. Provide the base64 payload as an argument, pass '-' to read
+  from stdin, or use --from-file to point at a file containing base64 data.
+  Options:
+    --append        Append to the existing file instead of overwriting.
+    --chmod MODE    Run chmod MODE on the file after writing (e.g. 0644).
+    --parents       Create parent directories for PATH as needed.
+    --from-file F   Read the base64 payload from file F.
+  USAGE
+        }
+
+FILE=""
+B64_ARG=""
+B64_FILE=""
+APPEND=false
+CHMOD_MODE=""
+MAKE_PARENTS=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --append)
+      APPEND=true
+      shift
+      ;;
+    --chmod)
+      CHMOD_MODE="${2:-}"
+      [ -n "$CHMOD_MODE" ] || { echo "write_file_b64: '--chmod' expects a mode" >&2; usage >&2; exit 2; }
+      shift 2
+      ;;
+    --parents)
+      MAKE_PARENTS=true
+      shift
+      ;;
+    --from-file)
+      B64_FILE="${2:-}"
+      [ -n "$B64_FILE" ] || { echo "write_file_b64: '--from-file' expects a path" >&2; usage >&2; exit 2; }
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -* )
+      echo "write_file_b64: unknown option '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      if [ -z "$FILE" ]; then
+        FILE="$1"
+      elif [ -z "$B64_ARG" ]; then
+        B64_ARG="$1"
+      else
+        echo "write_file_b64: unexpected argument '$1'" >&2
+        usage >&2
+        exit 2
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$FILE" ]; then
+  usage >&2
+  exit 2
+fi
+
+if [ -z "$B64_ARG" ] && [ -z "$B64_FILE" ]; then
+  if [ $# -gt 0 ]; then
+    B64_ARG="$1"
+    shift
+  else
+    B64_ARG="-"
+  fi
+fi
+
+TMP="$(mktemp)"
+cleanup() { rm -f "$TMP"; }
+trap cleanup EXIT
+
+if [ -n "$B64_FILE" ]; then
+  [ -f "$B64_FILE" ] || { echo "write_file_b64: base64 source '$B64_FILE' not found" >&2; exit 2; }
+  base64 -d "$B64_FILE" >"$TMP"
+elif [ "$B64_ARG" = "-" ]; then
+  base64 -d >"$TMP"
+else
+  printf '%s' "$B64_ARG" | base64 -d >"$TMP"
+fi
+
+if $MAKE_PARENTS; then
+  mkdir -p "$(dirname "$FILE")"
+fi
+
+if $APPEND; then
+  cat "$TMP" >>"$FILE"
+else
+  cat "$TMP" >"$FILE"
+fi
+
+if [ -n "$CHMOD_MODE" ]; then
+  chmod "$CHMOD_MODE" "$FILE"
+fi
+BASH
+chmod +x "${TARGET}/scripts/swe/write_file_b64"
+install -m 755 "${TARGET}/scripts/swe/write_file_b64" /usr/local/bin/write_file_b64
+
+# 4) Custom submit tool (stage by default; push+MR only on --finalize)
+BUNDLE_DIR="/opt/swe-agent-src/tools/gitlab_bundle"
+rm -rf "$BUNDLE_DIR"
+mkdir -p "$BUNDLE_DIR/bin"
+
+cat > "$BUNDLE_DIR/bin/submit" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+die(){ echo "ERROR: $*" >&2; exit 1; }
+req(){ command -v "$1" >/dev/null 2>&1 || die "missing dep: $1"; }
+urlenc(){ python3 - "$1" <<'PY'
+import sys, urllib.parse as u; print(u.quote(sys.argv[1], safe=""))
+PY
+}
+
+# ---------- args ----------
+TITLE=""; DESC=""; TITLE_FILE=""; DESC_FILE=""; SOURCE_BRANCH_ARG=""
+TARGET_BRANCH="${TARGET_BRANCH:-${CI_DEFAULT_BRANCH:-main}}"
+LABELS=""; DRAFT=false; FINALIZE=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --title)
+      if [ $# -ge 2 ]; then
+        TITLE="$2"
+        shift 2
+      else
+        TITLE=""
+        shift
+      fi
+      ;;
+    --description)
+      if [ $# -ge 2 ]; then
+        DESC="$2"
+        shift 2
+      else
+        DESC=""
+        shift
+      fi
+      ;;
+    --title-file)
+      if [ $# -ge 2 ]; then
+        TITLE_FILE="$2"
+        shift 2
+      else
+        TITLE_FILE=""
+        shift
+      fi
+      ;;
+    --description-file|--desc-file)
+      if [ $# -ge 2 ]; then
+        DESC_FILE="$2"
+        shift 2
+      else
+        DESC_FILE=""
+        shift
+      fi
+      ;;
+    --target|--target-branch)
+      if [ $# -ge 2 ]; then
+        TARGET_BRANCH="$2"
+        shift 2
+      else
+        TARGET_BRANCH=""
+        shift
+      fi
+      ;;
+    --labels)
+      if [ $# -ge 2 ]; then
+        LABELS="$2"
+        shift 2
+      else
+        LABELS=""
+        shift
+      fi
+      ;;
+    --source|--source-branch)
+      if [ $# -ge 2 ]; then
+        SOURCE_BRANCH_ARG="$2"
+        shift 2
+      else
+        SOURCE_BRANCH_ARG=""
+        shift
+      fi
+      ;;
+    --draft)
+      if [ $# -ge 2 ] && [ "${2#-}" = "$2" ]; then
+        case "${2,,}" in
+          true|false) DRAFT=${2,,};;
+          1) DRAFT=true;;
+          0) DRAFT=false;;
+          *) die "invalid value for --draft: $2";;
+        esac
+        shift 2
+      else
+        DRAFT=true
+        shift
+      fi
+      ;;
+    --finalize)
+      if [ $# -ge 2 ] && [ "${2#-}" = "$2" ]; then
+        case "${2,,}" in
+          true|false) FINALIZE=${2,,};;
+          1) FINALIZE=true;;
+          0) FINALIZE=false;;
+          *) die "invalid value for --finalize: $2";;
+        esac
+        shift 2
+      else
+        FINALIZE=true
+        shift
+      fi
+      ;;
+    *)
+      die "unknown arg: $1"
+      ;;
+  esac
+done
+
+if [ -n "$SOURCE_BRANCH_ARG" ]; then
+  SOURCE_BRANCH="$SOURCE_BRANCH_ARG"
+fi
+
+# ---------- deps & repo ----------
+req git; req curl; req jq; req python3
+API_BASE="${CI_API_V4_URL:-${GITLAB_URL:+$GITLAB_URL/api/v4}}"; [ -n "$API_BASE" ] || die "CI_API_V4_URL or GITLAB_URL required"
+PROJECT_REF="${CI_PROJECT_PATH:-${GITLAB_PROJECT_PATH:-}}"
+if [ -z "$PROJECT_REF" ]; then
+  PROJECT_REF="${CI_PROJECT_ID:-${GITLAB_PROJECT:-}}"
+fi
+[ -n "$PROJECT_REF" ] || die "CI_PROJECT_PATH, CI_PROJECT_ID, GITLAB_PROJECT_PATH, or GITLAB_PROJECT required"
+PROJECT_REF_ENC="$(urlenc "$PROJECT_REF")"
+MERGE_REQUEST_ENDPOINT="${API_BASE}/projects/${PROJECT_REF_ENC}/merge_requests"
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repo"
+git config user.email  "${GIT_COMMIT_EMAIL:-ci-bot@x.com}" || true
+git config user.name   "${GIT_COMMIT_NAME:-X CI Bot}"      || true
+git config --global --add safe.directory "$(pwd)" || true
+
+# ---------- state ----------
+SWE_DIR=".git/swe"; META="$SWE_DIR/meta.json"; mkdir -p "$SWE_DIR"
+[ -n "${SUBMIT_TARGET_BRANCH:-}" ] && TARGET_BRANCH="$SUBMIT_TARGET_BRANCH"
+
+: "${SOURCE_BRANCH:=}"
+if [ -z "$SOURCE_BRANCH" ] && [ -f "$SWE_DIR/branch" ]; then
+  SOURCE_BRANCH="$(tr -d '\n' < "$SWE_DIR/branch")"
+fi
+if [ -z "$SOURCE_BRANCH" ]; then
+  for candidate in "${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME:-}" "${CI_COMMIT_BRANCH:-}" "${CI_COMMIT_REF_NAME:-}"; do
+    if [ -n "$candidate" ]; then
+      SOURCE_BRANCH="$candidate"
+      break
+    fi
+  done
+fi
+cur_sym="$(git symbolic-ref -q --short HEAD || true)"
+if [ -z "$SOURCE_BRANCH" ] || [ "$SOURCE_BRANCH" = "HEAD" ]; then
+  SOURCE_BRANCH="${cur_sym}"
+fi
+if [ -z "$SOURCE_BRANCH" ] || [ "$SOURCE_BRANCH" = "HEAD" ]; then
+  SOURCE_BRANCH="swe-agent/${USER:-agent}-$(date +%Y%m%d-%H%M%S)"
+fi
+printf '%s' "$SOURCE_BRANCH" > "$SWE_DIR/branch"
+
+BASE_REF="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-${CI_COMMIT_REF_NAME:-${TARGET_BRANCH:-${CI_DEFAULT_BRANCH:-main}}}}"
+BASE_COMMIT="$(git rev-parse --verify "$BASE_REF" 2>/dev/null || git rev-parse --verify HEAD)"
+if git show-ref --verify --quiet "refs/heads/$SOURCE_BRANCH"; then
+  git checkout "$SOURCE_BRANCH"
+else
+  if git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_BRANCH"; then
+    git checkout -B "$SOURCE_BRANCH" "origin/$SOURCE_BRANCH"
+  elif [ -n "${CI_COMMIT_SHA:-}" ]; then
+    git checkout -B "$SOURCE_BRANCH" "${CI_COMMIT_SHA}"
+  else
+    git checkout -B "$SOURCE_BRANCH" "$BASE_COMMIT"
+  fi
+fi
+
+# ---------- metadata (flags > env > files > mrdesc.txt > meta) ----------
+read_tag(){ local t="$1"; [ -f mrdesc.txt ] || { echo ""; return; }
+  awk -v t="$t" 'BEGIN{inb=0} tolower($0)~"<"tolower(t)">$"{inb=1;next} tolower($0)~"</"tolower(t)">$"{inb=0;print "";exit} inb{print}' mrdesc.txt | sed -e 's/\r$//'
+}
+[ -n "$TITLE" ] || TITLE="${SUBMIT_TITLE:-}"
+[ -n "$DESC"  ] || DESC="${SUBMIT_DESCRIPTION:-${SUBMIT_DESC:-}}"
+[ -n "$TITLE" ] || { [ -n "$TITLE_FILE" ] && [ -f "$TITLE_FILE" ] && TITLE="$(cat "$TITLE_FILE" 2>/dev/null)" || true; }
+[ -n "$DESC"  ] || { [ -n "$DESC_FILE"  ] && [ -f "$DESC_FILE"  ] && DESC="$(cat "$DESC_FILE"  2>/dev/null)" || true; }
+[ -n "$TITLE" ] || TITLE="$(read_tag TITLE)"
+[ -n "$DESC"  ] || DESC="$(read_tag PR_DESCRIPTION)"
+if [ -f "$META" ]; then
+  [ -n "$TITLE" ] || TITLE="$(jq -r '.title  // empty' "$META")"
+  [ -n "$DESC"  ] || DESC="$(jq  -r '.desc   // empty' "$META")"
+  [ -n "$LABELS" ] || LABELS="$(jq -r '.labels // empty' "$META")"
+  [ -n "$TARGET_BRANCH" ] || TARGET_BRANCH="$(jq -r '.target // empty' "$META")"
+fi
+
+# ---------- STAGE (default): local commit only ----------
+if ! $FINALIZE; then
+  if [ -n "$(git status --porcelain)" ]; then
+    if git log -1 --pretty=%s 2>/dev/null | grep -q 'chore(swe-agent): stage changes'; then
+      git add -A && git commit --amend --no-edit
+    else
+      git add -A && git commit -m "chore(swe-agent): stage changes [skip ci]"
+    fi
+  fi
+  jq -n --arg title "$TITLE" --arg desc "$DESC" --arg labels "$LABELS" --arg dst "$TARGET_BRANCH" \
+    '{
+      title:   ($title  | select(length>0)),
+      desc:    ($desc   | select(length>0)),
+      labels:  ($labels | select(length>0)),
+      target:  ($dst    | select(length>0))
+    }' > "$SWE_DIR/_meta.part"
+  if [ -f "$META" ]; then
+    jq -s 'def co(a;b): if a==null or a=="" then b else a end;
+          .[1] as $n | .[0] as $o |
+          {title:co($n.title;$o.title), desc:co($n.desc;$o.desc), labels:co($n.labels;$o.labels), target:co($n.target;$o.target)}' \
+      "$META" "$SWE_DIR/_meta.part" > "$SWE_DIR/_meta.merged"
+    mv "$SWE_DIR/_meta.merged" "$META"; rm -f "$SWE_DIR/_meta.part"
+  else
+    mv "$SWE_DIR/_meta.part" "$META"
+  fi
+  jq -n --arg branch "$SOURCE_BRANCH" '{ok:true,mode:"staged",branch:$branch}'; exit 0
+fi
+
+# ---------- FINALIZE: push & open MR ----------
+if [ -z "$TITLE" ]; then
+  TITLE="chore(swe-agent): automated changes"
+fi
+if [ -z "$DESC" ]; then
+  DESC="Automated updates prepared by SWE-agent."
+fi
+[ -n "$TITLE" ] || die "Finalize needs a title"
+[ -n "$DESC"  ] || die "Finalize needs a description"
+if [ -z "$SOURCE_BRANCH" ] && [ -f "$SWE_DIR/branch" ]; then
+  SOURCE_BRANCH="$(tr -d '\n' < "$SWE_DIR/branch")"
+fi
+if [ -z "$SOURCE_BRANCH" ] && [ -n "${SWE_BRANCH:-}" ]; then
+  SOURCE_BRANCH="$SWE_BRANCH"
+fi
+if [ -z "$SOURCE_BRANCH" ]; then
+  SOURCE_BRANCH="$(git symbolic-ref -q --short HEAD || true)"
+fi
+if [ -z "$SOURCE_BRANCH" ]; then
+  die "Finalize needs a source branch"
+fi
+if [ -z "$TARGET_BRANCH" ]; then
+  TARGET_BRANCH="${SUBMIT_TARGET_BRANCH:-${CI_DEFAULT_BRANCH:-main}}"
+fi
+[ -n "$TARGET_BRANCH" ] || die "Finalize needs a target branch"
+if [ -f "$SWE_DIR/finalized" ]; then jq -n '{ok:true,mode:"already_finalized"}'; exit 0; fi
+
+if [ -n "$(git status --porcelain)" ]; then
+  git add -A && git commit -m "chore(swe-agent): stage changes before finalize [skip ci]"
+fi
+if [ ! -f "$SWE_DIR/ready_to_finalize" ]; then
+  echo "Finalize blocked: .git/swe/ready_to_finalize missing." >&2
+  jq -n '{ok:false,error:"not_ready"}'; exit 1
+fi
+
+printf 'submit finalize debug: title=%s source=%s target=%s\n' "$TITLE" "$SOURCE_BRANCH" "$TARGET_BRANCH" >&2
+
+if git remote get-url origin >/dev/null 2>&1; then
+  if [ -n "${GIT_PUSH_TOKEN:-}" ] && [ -n "${CI_SERVER_HOST:-}" ] && [ -n "${CI_PROJECT_PATH:-}" ]; then
+    git remote set-url origin "https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" || true
+  fi
+fi
+git push -u origin "$SOURCE_BRANCH" || { jq -n '{ok:false,error:"push_denied"}'; exit 1; }
+
+if [ -z "${GIT_PUSH_TOKEN:-}" ]; then
+  echo "GIT_PUSH_TOKEN is required to finalize changes (missing)." >&2
+  jq -n '{ok:false,error:"missing_push_token"}'; exit 1
+fi
+AUTH_HEADER="Authorization: Bearer ${GIT_PUSH_TOKEN}"
+
+ENC_SRC="$(urlenc "$SOURCE_BRANCH")"
+ENC_DST="$(urlenc "$TARGET_BRANCH")"
+MR_LOOKUP_URL="${MERGE_REQUEST_ENDPOINT}?state=opened&source_branch=${ENC_SRC}&target_branch=${ENC_DST}"
+EXISTING="$(curl -sS -k "$MR_LOOKUP_URL" -H "$AUTH_HEADER" || true)"
+HAS_EXISTING=false
+if echo "$EXISTING" | jq -e "type == 'array' and length > 0" >/dev/null 2>&1; then
+  HAS_EXISTING=true
+fi
+
+PAYLOAD="$(jq -n \
+  --arg title "$TITLE" \
+  --arg desc "$DESC" \
+  --arg src "$SOURCE_BRANCH" \
+  --arg dst "$TARGET_BRANCH" \
+  --arg labels "$LABELS" \
+  --argjson draft "$DRAFT" \
+  '{
+    title: $title,
+    description: $desc,
+    source_branch: $src,
+    target_branch: $dst,
+    remove_source_branch: false,
+    draft: $draft
+  } + (if ($labels | length) > 0 then {labels: $labels} else {} end)
+  '
+)"
+echo "submit finalize payload: $PAYLOAD" >&2
+
+if $HAS_EXISTING; then
+  echo "Merge request already exists for ${SOURCE_BRANCH}->${TARGET_BRANCH}; skipping creation." >&2
+  RESP="$(echo "$EXISTING" | jq '.[0]' 2>/dev/null || echo '{}')"
+else
+  RESP="$(curl -sS -k --request POST \
+    -H "$AUTH_HEADER" \
+    -H "Content-Type: application/json" \
+    --data "$PAYLOAD" \
+    "$MERGE_REQUEST_ENDPOINT" || true)"
+fi
+
+if ! $HAS_EXISTING && [ "$(echo "$RESP" | jq -r 'has("web_url")')" != "true" ]; then
+  EXIST="$(curl -sS -k "$MR_LOOKUP_URL" \
+    -H "$AUTH_HEADER" || true)"
+  if [ "$(echo "$EXIST" | jq 'length')" -gt 0 ]; then
+    jq -n --arg url "$(echo "$EXIST" | jq -r '.[0].web_url')" --arg iid "$(echo "$EXIST" | jq -r '.[0].iid')" \
+      '{ok:true,mode:"existing",web_url:$url,iid:$iid}'; exit 0
+  fi
+  jq -n --arg raw "$RESP" '{ok:false,raw:$raw}'; exit 1
+fi
+
+RESULT_MODE="created"
+if $HAS_EXISTING; then RESULT_MODE="existing"; fi
+echo "1" > "$SWE_DIR/finalized"
+jq -n --arg url "$(echo "$RESP" | jq -r '.web_url')" --arg iid "$(echo "$RESP" | jq -r '.iid')" --arg mode "$RESULT_MODE" \
+  '{ok:true,mode:$mode,web_url:$url,iid:$iid}'
+SH
+chmod +x "$BUNDLE_DIR/bin/submit"
+
+cat > "$BUNDLE_DIR/config.yaml" <<'YML'
+tools:
+  submit:
+    signature: "submit [--title {title}|--title-file {title_file}] [--description {description}|--description-file {description_file}] [--source {source_branch}] [--target {target_branch}] [--labels {labels}] [--draft {draft}] [--finalize {finalize}]"
+    docstring: "Stage-only by default; run --finalize once to push and open the MR."
+    arguments:
+      - { name: title, type: string, required: false, description: "Optional MR title override" }
+      - { name: description, type: string, required: false, description: "Optional MR body override" }
+      - { name: title_file, type: string, required: false, description: "Path to file containing MR title" }
+      - { name: description_file, type: string, required: false, description: "Path to file containing MR description" }
+      - { name: source_branch, type: string, required: false, description: "Source branch name" }
+      - { name: target_branch, type: string, required: false, description: "Destination branch name" }
+      - { name: labels, type: string, required: false, description: "Comma-separated labels" }
+      - { name: draft, type: boolean, required: false, description: "Set merge request to draft (accepts true/false, default false)" }
+      - { name: finalize, type: boolean, required: false, description: "Push commits and open merge request (accepts true/false)" }
+YML
+
+# 5) Put helpers and submit on PATH
+export PATH="${TARGET}/scripts/swe:/opt/swe-agent-src/tools/gitlab_bundle/bin:$PATH"
+which insert_after_regex >/dev/null || { echo "insert_after_regex not on PATH"; exit 1; }
+which write_file_b64     >/dev/null || { echo "write_file_b64 not on PATH"; exit 1; }
+which submit             >/dev/null || { echo "submit not on PATH"; exit 1; }
+
+# 6) Root agent config (DISCUSSION format + thought_action parser)
+cat > "${TARGET}/config.yaml" <<'YML'
+agent:
+  type: default
+
+  templates:
+    system_template: |-
+      You can run shell commands in a Linux environment.
+    instance_template: |-
+      <uploaded_files>
+      {{working_dir}}
+      </uploaded_files>
+      <pr_description>
+      {{problem_statement}}
+      </pr_description>
+      Rules:
+      - Output MUST be exactly:
+        DISCUSSION
+        <1–2 sentences>
+        ```
+        <ONE bash command>
+        ```
+      - Never use heredocs (<<EOF) or apply_patch.
+      - Prefer helper CLIs when editing files: insert_after_regex, write_file_b64.
+      - Step 1 is reserved for repository reconnaissance; run a read-only command to review existing code before modifying anything.
+      - Stay on the existing merge-request branch; never create or checkout a new branch.
+      - Maintain unit testing coverage; when modified code lacks tests, add them and create mocks as needed so they pass.
+      - If you discover build or lint issues while inspecting or implementing, fix them before moving on.
+      - Stage MR metadata using the `submit --title … --target …` command provided in the task before finalizing.
+      - Call `submit --finalize true` exactly once at the end (even if no files changed) and include the same `--title`, `--source`, and `--target` values you staged earlier (no placeholders).
+    next_step_template: |-
+      DISCUSSION
+      Based on the observation, run the single command for the next unfinished step (Step 1: inspect the repo, Step 2: implement the change, Step 3: stage metadata, Step 4: touch the ready flag, Step 5: finalize). Do not repeat a step that already reported success (for example, when you see `ok: true`), and never include commands for future steps.
+
+      Observation:
+      {{observation}}
+
+      ```
+      # your single bash command goes here
+      ```
+    next_step_no_output_template: |-
+      DISCUSSION
+      Previous command had no output; continue with the next precise step.
+
+      ```
+      # your single bash command goes here
+      ```
+  tools:
+    enable_bash_tool: true
+    execution_timeout: 300
+    parse_function:
+      type: thought_action
+      code_block_language: bash
+    bundles:
+      - path: /opt/swe-agent-src/tools/gitlab_bundle
+YML
+
+# 7) Task file (heredoc in CI; the "no heredocs" rule is for model outputs only)
+TASK_FILE="/tmp/swe-task.txt"
+TASK_FILE_PATH="$TASK_FILE" python3 - <<'PYTASK'
+import json
+import os
+from pathlib import Path
+from collections import Counter
+import textwrap
+import urllib.error
+import urllib.request
+
+
+def fetch_mr_info() -> dict:
+    iid = os.getenv('CI_MERGE_REQUEST_IID')
+    api = os.getenv('CI_API_V4_URL')
+    project = os.getenv('CI_PROJECT_ID')
+    if not (iid and api and project):
+        return {}
+
+    tokens = []
+    job_token = os.getenv('CI_JOB_TOKEN')
+    if job_token:
+        tokens.append(('JOB-TOKEN', job_token))
+    for env in ('GITLAB_TOKEN', 'GIT_PUSH_TOKEN'):
+        token = os.getenv(env)
+        if token:
+            tokens.append(('PRIVATE-TOKEN', token))
+    if not tokens:
+        return {}
+
+    url = f"{api}/projects/{project}/merge_requests/{iid}"
+    for header, token in tokens:
+        req = urllib.request.Request(url, headers={header: token})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.getcode() == 200:
+                    return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                continue
+        except Exception:
+            continue
+    return {}
+
+
+def pick_body(default: str, mr_description: str) -> str:
+    for value in (
+        os.getenv('SWE_TASK'),
+        mr_description,
+        os.getenv('CI_MERGE_REQUEST_DESCRIPTION'),
+        os.getenv('MR_DESC'),
+    ):
+        if value:
+            value = value.strip()
+            if value:
+                return value
+
+    return default
+
+
+mr_info = fetch_mr_info()
+mr_description = (mr_info.get('description') or '').strip()
+body = pick_body('Complete the requested changes.', mr_description)
+
+title = (
+    os.getenv('SWE_TITLE')
+    or os.getenv('MR_TITLE')
+    or mr_info.get('title')
+    or os.getenv('CI_MERGE_REQUEST_TITLE')
+    or 'chore(swe-agent): automated changes'
+)
+
+target = (
+    os.getenv('SWE_TARGET')
+    or mr_info.get('target_branch')
+    or os.getenv('CI_MERGE_REQUEST_TARGET_BRANCH_NAME')
+    or os.getenv('CI_DEFAULT_BRANCH')
+    or 'main'
+)
+
+title_arg = json.dumps(title)
+target_arg = json.dumps(target)
+
+repo_root = Path(os.environ['TARGET'])
+branch_name = (
+    os.getenv('SWE_BRANCH')
+    or mr_info.get('source_branch')
+    or os.getenv('CI_MERGE_REQUEST_SOURCE_BRANCH_NAME')
+    or os.getenv('CI_COMMIT_REF_NAME')
+    or os.getenv('CI_COMMIT_BRANCH')
+    or 'unknown'
+)
+
+EXT_TO_LANGUAGE = {
+    '.c': 'C',
+    '.cc': 'C++',
+    '.cpp': 'C++',
+    '.cs': 'C#',
+    '.css': 'CSS',
+    '.go': 'Go',
+    '.gohtml': 'Go Template',
+    '.graphql': 'GraphQL',
+    '.hs': 'Haskell',
+    '.java': 'Java',
+    '.js': 'JavaScript',
+    '.jsx': 'JavaScript',
+    '.kt': 'Kotlin',
+    '.m': 'Objective-C',
+    '.mm': 'Objective-C++',
+    '.php': 'PHP',
+    '.py': 'Python',
+    '.rb': 'Ruby',
+    '.rs': 'Rust',
+    '.scala': 'Scala',
+    '.sh': 'Shell',
+    '.swift': 'Swift',
+    '.ts': 'TypeScript',
+    '.tsx': 'TypeScript',
+    '.vue': 'Vue',
+}
+
+SKIP_SUFFIXES = {
+    '.bmp', '.csv', '.gif', '.ico', '.jpeg', '.jpg', '.lock', '.log', '.md', '.pdf', '.png', '.svg', '.toml', '.txt', '.xml', '.yaml', '.yml', '.json', '.sum'
+}
+
+def summarize_repo(root: Path) -> str:
+    try:
+        entries = []
+        for entry in sorted(root.iterdir()):
+            name = entry.name
+            if name.startswith('.'):
+                continue
+            suffix = '/' if entry.is_dir() else ''
+            entries.append(f"{name}{suffix}")
+            if len(entries) >= 8:
+                break
+    except Exception:
+        entries = []
+    top_entries = ', '.join(entries) if entries else 'n/a'
+
+    counter = Counter()
+    try:
+        for path in root.rglob('*'):
+            if not path.is_file():
+                continue
+            name = path.name
+            if name.startswith('.'):
+                continue
+            suffix = path.suffix.lower()
+            if not suffix or suffix in SKIP_SUFFIXES:
+                continue
+            counter[suffix] += 1
+    except Exception:
+        pass
+
+    top_langs = []
+    for suffix, count in counter.most_common(5):
+        lang = EXT_TO_LANGUAGE.get(suffix, suffix.lstrip('.') or 'other')
+        top_langs.append(f"{lang} ({count})")
+    languages = ', '.join(top_langs) if top_langs else 'n/a'
+
+    go_mod = 'yes' if (root / 'go.mod').exists() else 'no'
+
+    current_model = os.getenv('OPENAI_MODEL', 'lm_studio/openai/gpt-oss-120b')
+    lines = [
+        f"- Current branch: {branch_name}",
+        f"- Selected model: {current_model}",
+        f"- Top-level entries: {top_entries}",
+        f"- Detected languages: {languages}",
+        f"- go.mod present: {go_mod}",
+    ]
+    return '\n'.join(f"      {line}" for line in lines)
+
+repo_overview = summarize_repo(repo_root)
+
+branch_file = repo_root / '.git' / 'swe' / 'branch'
+branch_file.parent.mkdir(parents=True, exist_ok=True)
+if branch_name not in {'', 'HEAD', 'unknown', None}:
+    branch_file.write_text(branch_name.strip() + '\n', encoding='utf-8')
+
+content = textwrap.dedent(
+    f"""ACTIONS ONLY (NO PROSE). EXACT FORMAT:
+
+Repository snapshot:
+{repo_overview}
+
+Work through these steps sequentially. Reply with exactly one step per message (Step 1 through Step 5). Never include commands for future steps. When a step reports success (for example, a command prints `ok: true`), immediately advance to the next one and do not repeat completed steps.
+
+Mission priorities:
+  1. Finish the coding task on the current issue branch. Stay in Step 2 until the requested changes are implemented, unit testing coverage exists (add tests and mocks when missing), relevant tests or linters pass, and `git status` is clean.
+  2. Push the completed branch so the fix is available remotely.
+  3. Only after the branch is complete, update or create the merge request. If one already exists for this branch, reuse it instead of creating a new one.
+
+Step 1:
+DISCUSSION + one bash command to inspect the repository so you understand the existing implementation before editing.
+
+Step 2:
+DISCUSSION + one bash command to implement the requested changes using the existing tech stack and helper CLIs (for example, insert_after_regex, write_file_b64) while staying on the current branch (do not create new branches). Ensure unit testing coverage exists for the affected code—add unit-focused tests and create mocks as needed before proceeding. Confirm the fix locally (tests, formatters, etc.) and do not leave this step until the branch is ready to push. Task details:
+{body}
+
+Step 3:
+DISCUSSION + one bash command to stage MR metadata on the current branch (after the code is ready):
+submit --title {title_arg} --target {target_arg}
+
+Step 4:
+DISCUSSION + one bash command to signal readiness for finalization (set this flag only when Step 2 is truly complete; otherwise return to Step 2):
+touch .git/swe/ready_to_finalize
+
+Step 5:
+DISCUSSION + one bash command to finalize the changes and then stop. Run this command even when no new edits were necessary so the merge request is refreshed, and pass `--title`, `--source`, `--target` explicitly with the actual values you staged earlier. The helper will reuse any existing MR for this branch instead of creating a duplicate.
+submit --finalize true --title "<TITLE>" --source "<SOURCE_BRANCH>" --target "<TARGET_BRANCH>"
+"""
+)
+
+Path(os.environ['TASK_FILE_PATH']).write_text(content, encoding='utf-8')
+PYTASK
+# 8) Model env (adjust to your model server)
+export OPENAI_API_KEY="${OPENAI_API_KEY:-lm-studio}"
+if [ -n "${OPENAI_BASE_URL:-}" ]; then
+  OPENAI_API_BASE="${OPENAI_BASE_URL}"
+fi
+OPENAI_API_BASE="${OPENAI_API_BASE:-http://192.168.1.254:1234/v1}"
+OPENAI_BASE_URL="${OPENAI_BASE_URL:-$OPENAI_API_BASE}"
+export OPENAI_API_BASE OPENAI_BASE_URL
+export OPENAI_MODEL="${OPENAI_MODEL:-lm_studio/openai/gpt-oss-120b}"
+export SWE_HAS_LABEL_API_BASE=0
+
+# Label-based overrides for SWE-agent runtime tuning
+LABEL_EXPORTS=$(python3 <<'PY'
+import json
+import os
+import shlex
+import urllib.error
+import urllib.request
+
+
+def fetch_mr_info():
+    iid = os.getenv('CI_MERGE_REQUEST_IID')
+    api = os.getenv('CI_API_V4_URL')
+    project = os.getenv('CI_PROJECT_ID')
+    if not (iid and api and project):
+        return {}
+
+    tokens = []
+    job_token = os.getenv('CI_JOB_TOKEN')
+    if job_token:
+        tokens.append(('JOB-TOKEN', job_token))
+    for env in ('GITLAB_TOKEN', 'GIT_PUSH_TOKEN'):
+        token = os.getenv(env)
+        if token:
+            tokens.append(('PRIVATE-TOKEN', token))
+    if not tokens:
+        return {}
+
+    url = f"{api}/projects/{project}/merge_requests/{iid}"
+    for header, token in tokens:
+        req = urllib.request.Request(url, headers={header: token})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.getcode() == 200:
+                    return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                continue
+        except Exception:
+            continue
+    return {}
+
+
+def label_names(items):
+    labels = []
+    for item in items:
+        if isinstance(item, dict):
+            value = item.get('title') or item.get('name')
+        else:
+            value = str(item)
+        if value:
+            labels.append(str(value).strip())
+    return labels
+
+
+def first_value(prefix, items, default=None):
+    target = prefix.lower().rstrip(':=')
+    if not target:
+        return default
+    for raw in items:
+        text = str(raw).strip()
+        lower = text.lower()
+        for sep in (':', '='):
+            needle = f"{target}{sep}"
+            if lower.startswith(needle):
+                candidate = text[len(needle):].strip()
+                if candidate:
+                    return candidate
+        if lower.startswith(prefix.lower()):
+            remainder = text[len(prefix):].lstrip(':= ').strip()
+            if remainder:
+                return remainder
+    return default
+
+
+def sanitize_int(value, default):
+    if value is None:
+        return default
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def sanitize_float(value, default):
+    if value is None:
+        return default
+    try:
+        float(value)
+        return value
+    except (TypeError, ValueError):
+        return default
+
+
+mr_info = fetch_mr_info()
+label_values = label_names(mr_info.get('labels', []))
+env_labels = os.getenv('CI_MERGE_REQUEST_LABELS')
+if env_labels:
+    label_values.extend(label.strip() for label in env_labels.split(',') if label.strip())
+api_base_value = first_value('api_base:', label_values)
+if not api_base_value:
+    api_base_value = first_value('baseurl:', label_values)
+if api_base_value:
+    print(f"export OPENAI_API_BASE={shlex.quote(api_base_value)}")
+    print("export SWE_HAS_LABEL_API_BASE=1")
+
+values = {
+    'SWE_DEPLOYMENT_TYPE': first_value('deployment:', label_values, os.getenv('SWE_DEPLOYMENT_TYPE', 'local')),
+    'SWE_MAX_INPUT_TOKENS': sanitize_int(first_value('maxtokens:', label_values), os.getenv('SWE_MAX_INPUT_TOKENS', '128000')),
+    'SWE_INSTANCE_COST_LIMIT': sanitize_float(first_value('costlimit:', label_values), os.getenv('SWE_INSTANCE_COST_LIMIT', '0.00')),
+    'SWE_TOTAL_COST_LIMIT': sanitize_float(first_value('totalcost:', label_values), os.getenv('SWE_TOTAL_COST_LIMIT', '0')),
+    'SWE_PER_INSTANCE_CALL_LIMIT': sanitize_int(first_value('calllimit:', label_values), os.getenv('SWE_PER_INSTANCE_CALL_LIMIT', '100')),
+}
+for key, val in values.items():
+    print(f"export {key}={shlex.quote(str(val))}")
+PY
+)
+if [ -n "$LABEL_EXPORTS" ]; then
+  eval "$LABEL_EXPORTS"
+fi
+if [ -z "${OPENAI_API_BASE:-}" ]; then
+  OPENAI_API_BASE="http://192.168.1.254:1234/v1"
+fi
+if [ -z "${OPENAI_BASE_URL:-}" ]; then
+  OPENAI_BASE_URL="$OPENAI_API_BASE"
+fi
+export OPENAI_API_BASE OPENAI_BASE_URL
+
+# 9) Preflight
+echo "Expect these to exist:"; ls -l "$TASK_FILE" "${TARGET}/config.yaml"
+echo "TARGET=${TARGET}"
+
+# 10) Run SWE-agent (prefer /venv/bin if present)
+SA_BIN="/venv/bin/sweagent"; [ -x "$SA_BIN" ] || SA_BIN="$(command -v sweagent)"
+source /venv/bin/activate 2>/dev/null || true
+set -- \
+  --config "${TARGET}/config.yaml"
+if [ "${SWE_DEPLOYMENT_TYPE:-local}" != "remote" ]; then
+  set -- "$@" --env.deployment.type="${SWE_DEPLOYMENT_TYPE:-local}"
+fi
+set -- "$@" \
+  --env.repo.type=preexisting \
+  --env.repo.repo_name="${REPO_NAME}" \
+  --problem_statement.path="${TASK_FILE}" \
+  --output_dir="sweagent_runs" \
+  --agent.model.name="$OPENAI_MODEL" \
+  --agent.model.max_input_tokens="${SWE_MAX_INPUT_TOKENS:-128000}" \
+  --agent.model.per_instance_cost_limit="${SWE_INSTANCE_COST_LIMIT:-0.00}" \
+  --agent.model.total_cost_limit="${SWE_TOTAL_COST_LIMIT:-0}" \
+  --agent.model.per_instance_call_limit="${SWE_PER_INSTANCE_CALL_LIMIT:-100}"
+if [ "${SWE_HAS_LABEL_API_BASE:-0}" = "1" ]; then
+  set -- "$@" --agent.model.api_base="$OPENAI_API_BASE"
+fi
+echo "SWE-agent run variable values:"
+for var in \
+  REPO_NAME \
+  TARGET \
+  TASK_FILE \
+  SWE_DEPLOYMENT_TYPE \
+  SWE_MAX_INPUT_TOKENS \
+  SWE_INSTANCE_COST_LIMIT \
+  SWE_TOTAL_COST_LIMIT \
+  SWE_PER_INSTANCE_CALL_LIMIT \
+  OPENAI_MODEL \
+  OPENAI_API_BASE \
+  OPENAI_BASE_URL \
+  SWE_HAS_LABEL_API_BASE; do
+  if declare -p "$var" >/dev/null 2>&1; then
+    value="${!var}"
+    if [ -z "$value" ]; then
+      value="<empty>"
+    fi
+  else
+    value="<unset>"
+  fi
+  value="${value//$'\n'/\\n}"
+  printf '  %-32s %s\n' "$var" "$value"
+done
+# Log the exact command configuration before running sweagent for easier debugging.
+echo "SWE-agent executable: ${SA_BIN}"
+echo "SWE-agent run arguments:"
+idx=0
+for arg in "$@"; do
+  printf '  [%02d] %s\n' "$idx" "$arg"
+  idx=$((idx + 1))
+done
+"$SA_BIN" run "$@"
+
+# 11) Logs
+LOG=$(ls -1t sweagent_runs/*/agent.log 2>/dev/null | head -n1 || true)
+echo "LOG => ${LOG:-<none>}"
+if [ -n "$LOG" ]; then
+  echo "=== Tail ==="; tail -n 100 "$LOG" || true
+fi
+
+if [ -d "${TARGET}/.git/swe" ] \
+   && [ -f "${TARGET}/.git/swe/ready_to_finalize" ] \
+   && [ ! -f "${TARGET}/.git/swe/finalized" ]; then
+  echo "Auto-finalizing SWE-agent changes at pipeline end..."
+
+  (
+    cd "$TARGET" && "$BUNDLE_DIR/bin/submit" \
+      --finalize true \
+      --title "$SUBMIT_TITLE" \
+      --target "${SUBMIT_TARGET_BRANCH:-$DEFAULT_TARGET}" \
+      --source "$(cat .git/swe/branch 2>/dev/null || git rev-parse --abbrev-ref HEAD)"
+  )
+fi
+artifacts:
+when: always
+paths:
+- sweagent_runs/
+- task.txt
+expire_in: 14 days
+allow_failure: true
+resource_group: "swe-agent-${CI_PROJECT_ID}-${CI_MERGE_REQUEST_IID:-$CI_COMMIT_REF_SLUG}"
+interruptible: true
